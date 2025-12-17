@@ -153,7 +153,7 @@ class CpuOptProvider : public CompiledOptProvider {
     auto dynamic_padder_options = DynamicPadderOptions();
     dynamic_padder_options.shape_check_mode =
         DynamicDimensionInference::ShapeCheckMode::kIgnore;
-    RegisterPass<DynamicPadder>(dynamic_padder_options);
+    // RegisterPass<DynamicPadder>(dynamic_padder_options);
     RegisterPass<ChangeOpDataType>(
         F16, F32, HloPredicateIsOp<HloOpcode::kDot, HloOpcode::kConvolution>);
     RegisterPass<TransposeFolding>(

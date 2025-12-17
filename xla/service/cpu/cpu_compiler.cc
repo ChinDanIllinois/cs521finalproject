@@ -822,7 +822,7 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
   // being ignored, and they would be broken if it is enforced.
   dynamic_padder_options.shape_check_mode =
       DynamicDimensionInference::ShapeCheckMode::kIgnore;
-  pipeline.AddPass<DynamicPadder>(dynamic_padder_options);
+  // pipeline.AddPass<DynamicPadder>(dynamic_padder_options);
 
   pipeline.AddPass<ConvCanonicalization>(target_machine_features);
 
@@ -1874,98 +1874,98 @@ CpuCompiler::CompileCpuExecutable(
     return absl::OkStatus();
   };
 
-  // If there are extra parts, compile them first, since we must
-  // remove the affected kernels from the LLVM module.
-  if (num_extra_parts > 0) {
-    TraceMe trace([&] {
-      return TraceMeEncode("CompileExtraKernels",
-                           {{"num_extra_parts", num_extra_parts}});
-    });
-    for (const auto& [backend_extra_options, kernels] :
-         backend_extra_options_to_kernels) {
-      TF_ASSIGN_OR_RETURN(std::unique_ptr<llvm::Module> new_module,
-                          ExtractKernelsFromModule(llvm_module.get(), kernels));
-      AddXlaBackendExtraOptionsAsModuleFlag(new_module.get(),
-                                            backend_extra_options);
-      TF_RETURN_IF_ERROR(add_module_for_compilation(std::move(new_module)));
-    }
-  }
+  // // If there are extra parts, compile them first, since we must
+  // // remove the affected kernels from the LLVM module.
+  // if (num_extra_parts > 0) {
+  //   TraceMe trace([&] {
+  //     return TraceMeEncode("CompileExtraKernels",
+  //                          {{"num_extra_parts", num_extra_parts}});
+  //   });
+  //   for (const auto& [backend_extra_options, kernels] :
+  //        backend_extra_options_to_kernels) {
+  //     TF_ASSIGN_OR_RETURN(std::unique_ptr<llvm::Module> new_module,
+  //                         ExtractKernelsFromModule(llvm_module.get(), kernels));
+  //     AddXlaBackendExtraOptionsAsModuleFlag(new_module.get(),
+  //                                           backend_extra_options);
+  //     TF_RETURN_IF_ERROR(add_module_for_compilation(std::move(new_module)));
+  //   }
+  // }
 
-  if (HasLargeConstants(*llvm_module) ||
-      thunk_emitter_options.is_aot_compilation) {
-    VLOG(3) << "Skip parallel compilation due to large constants or AOT "
-               "compilation";
-    num_default_parts = 1;
-  }
+  // if (HasLargeConstants(*llvm_module) ||
+  //     thunk_emitter_options.is_aot_compilation) {
+  //   VLOG(3) << "Skip parallel compilation due to large constants or AOT "
+  //              "compilation";
+  //   num_default_parts = 1;
+  // }
 
-  if (num_default_parts > 1) {
-    VLOG(3) << "Split LLVM module into " << num_default_parts
-            << " parts before codegen to enable parallel compilation"
-            << " (max split count: " << parallel_codegen_split_count << ")";
+  // if (num_default_parts > 1) {
+  //   VLOG(3) << "Split LLVM module into " << num_default_parts
+  //           << " parts before codegen to enable parallel compilation"
+  //           << " (max split count: " << parallel_codegen_split_count << ")";
 
-    TraceMe trace([&] {
-      return TraceMeEncode("SplitModule",
-                           {{"num_default_parts", num_default_parts}});
-    });
+  //   TraceMe trace([&] {
+  //     return TraceMeEncode("SplitModule",
+  //                          {{"num_default_parts", num_default_parts}});
+  //   });
 
-    auto add_module_for_compilation_no_status =
-        [&](std::unique_ptr<llvm::Module> llvm_module_part) -> void {
-      CHECK_OK(add_module_for_compilation(std::move(llvm_module_part)));
-    };
+  //   auto add_module_for_compilation_no_status =
+  //       [&](std::unique_ptr<llvm::Module> llvm_module_part) -> void {
+  //     CHECK_OK(add_module_for_compilation(std::move(llvm_module_part)));
+  //   };
 
-    llvm::SplitModule(*llvm_module, num_default_parts,
-                      add_module_for_compilation_no_status,
-                      /*PreserveLocals=*/true, /*RoundRobin=*/true);
-    // Free resources used by the original LLVM module.
-    llvm_module.reset();
-    llvm_context.reset();
-  } else {
-    VLOG(3) << "Compile LLVM module without splitting (max split count: "
-            << parallel_codegen_split_count << ")";
-    compiled_parts.push_back(
-        CollectCompiledSymbolsPart(ir_emitter2, *llvm_module));
-    TF_RETURN_IF_ERROR(llvm_module_compiler->AddModule(
-        llvm::orc::ThreadSafeModule(std::move(llvm_module),
-                                    std::move(llvm_context)),
-        /*dylib_index=*/0));
-  }
+  //   llvm::SplitModule(*llvm_module, num_default_parts,
+  //                     add_module_for_compilation_no_status,
+  //                     /*PreserveLocals=*/true, /*RoundRobin=*/true);
+  //   // Free resources used by the original LLVM module.
+  //   llvm_module.reset();
+  //   llvm_context.reset();
+  // } else {
+  //   VLOG(3) << "Compile LLVM module without splitting (max split count: "
+  //           << parallel_codegen_split_count << ")";
+  //   compiled_parts.push_back(
+  //       CollectCompiledSymbolsPart(ir_emitter2, *llvm_module));
+  //   TF_RETURN_IF_ERROR(llvm_module_compiler->AddModule(
+  //       llvm::orc::ThreadSafeModule(std::move(llvm_module),
+  //                                   std::move(llvm_context)),
+  //       /*dylib_index=*/0));
+  // }
 
-  // Collect compiled symbols from all LLVM module parts.
+  // // Collect compiled symbols from all LLVM module parts.
   std::vector<FunctionLibrary::Symbol> compiled_symbols;
 
   absl::flat_hash_map<FunctionLibrary::TypeId, SymbolProto::FunctionTypeId>
       symbol_type_id_to_function_type_id;
 
-  VLOG(3) << "Adding " << kernels.size() << " kernels to the JIT compiler";
-  // Make sure we use all the "default" modules for maximum parallelism.
-  int num_default_so_far = dylib_index - num_extra_parts;
-  int kernel_dylib_index =
-      num_default_so_far < num_default_parts ? num_default_so_far : 0;
-  for (auto& [name, module] : kernels) {
-    compiled_symbols.push_back(
-        FunctionLibrary::Sym<FunctionLibrary::Kernel>(name));
-    symbol_type_id_to_function_type_id.emplace(compiled_symbols.back().type_id,
-                                               SymbolProto::KERNEL);
-    TF_RETURN_IF_ERROR(llvm_module_compiler->AddModule(
-        std::move(module), num_extra_parts + kernel_dylib_index));
-    // Simply roundrobin the default kernel dylibs
-    kernel_dylib_index = (kernel_dylib_index + 1) % num_default_parts;
-  }
+  // VLOG(3) << "Adding " << kernels.size() << " kernels to the JIT compiler";
+  // // Make sure we use all the "default" modules for maximum parallelism.
+  // int num_default_so_far = dylib_index - num_extra_parts;
+  // int kernel_dylib_index =
+  //     num_default_so_far < num_default_parts ? num_default_so_far : 0;
+  // for (auto& [name, module] : kernels) {
+  //   compiled_symbols.push_back(
+  //       FunctionLibrary::Sym<FunctionLibrary::Kernel>(name));
+  //   symbol_type_id_to_function_type_id.emplace(compiled_symbols.back().type_id,
+  //                                              SymbolProto::KERNEL);
+  //   TF_RETURN_IF_ERROR(llvm_module_compiler->AddModule(
+  //       std::move(module), num_extra_parts + kernel_dylib_index));
+  //   // Simply roundrobin the default kernel dylibs
+  //   kernel_dylib_index = (kernel_dylib_index + 1) % num_default_parts;
+  // }
 
-  for (const CompiledSymbolsPart& part : compiled_parts) {
-    for (const IrEmitter2::KernelInfo& kernel : part.kernels) {
-      compiled_symbols.push_back(
-          FunctionLibrary::Sym<FunctionLibrary::Kernel>(kernel.name));
-      symbol_type_id_to_function_type_id.emplace(
-          compiled_symbols.back().type_id, SymbolProto::KERNEL);
-    }
-    for (const IrEmitter2::ComparatorInfo& comparator : part.comparators) {
-      compiled_symbols.push_back(
-          FunctionLibrary::Sym<FunctionLibrary::Comparator>(comparator.name));
-      symbol_type_id_to_function_type_id.emplace(
-          compiled_symbols.back().type_id, SymbolProto::COMPARATOR);
-    }
-  }
+  // for (const CompiledSymbolsPart& part : compiled_parts) {
+  //   for (const IrEmitter2::KernelInfo& kernel : part.kernels) {
+  //     compiled_symbols.push_back(
+  //         FunctionLibrary::Sym<FunctionLibrary::Kernel>(kernel.name));
+  //     symbol_type_id_to_function_type_id.emplace(
+  //         compiled_symbols.back().type_id, SymbolProto::KERNEL);
+  //   }
+  //   for (const IrEmitter2::ComparatorInfo& comparator : part.comparators) {
+  //     compiled_symbols.push_back(
+  //         FunctionLibrary::Sym<FunctionLibrary::Comparator>(comparator.name));
+  //     symbol_type_id_to_function_type_id.emplace(
+  //         compiled_symbols.back().type_id, SymbolProto::COMPARATOR);
+  //   }
+  // }
 
   VLOG(3) << "Collected " << compiled_symbols.size() << " compiled symbols";
 
