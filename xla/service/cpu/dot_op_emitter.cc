@@ -70,6 +70,8 @@ limitations under the License.
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 
+#define TILE_SIZE 8
+
 namespace xla {
 
 using llvm_ir::SetToFirstInsertPoint;
@@ -177,6 +179,7 @@ DotImplementationStrategy GetNonBatchDotImplementationStrategy(
          dot_info.dim_nums.rhs_batch_dimensions_size() == 0)
       << "Dot operations must be non-batch";
 
+  return DotImplementationStrategy::kNaiveLlvmIr;
   // Any Matrix-Vector product of floating point or integral type, or
   // a transpose-dot fusion of the same can be lowered to a tiled LLVM
   // IR implementation.
@@ -635,6 +638,22 @@ void DotOpEmitter::EmitNaiveLlvmIrGemm() {
   // Create loop nests which loop through the LHS operand dimensions and the RHS
   // operand dimensions. The reduction dimension of the LHS and RHS are handled
   // in a separate innermost loop which performs the sum of products.
+  llvm::Module *myModule = b_->GetInsertBlock()->getModule();
+  auto SizeGlobalPtr =
+    myModule->getOrInsertGlobal("size_global_ptr", b_->getInt64Ty());
+
+  llvm::Value *SizeGlobal =
+      b_->CreateLoad(b_->getInt64Ty(), SizeGlobalPtr, "size_global");
+  llvm::Value *TileSizeConstant = llvm::ConstantInt::get(b_->getInt64Ty(), TILE_SIZE);
+  llvm::Value *TileSizeConstantMinusOne = llvm::ConstantInt::get(b_->getInt64Ty(), TILE_SIZE - 1);
+
+  llvm::Value *Sum = b_->CreateAdd(SizeGlobal, TileSizeConstantMinusOne, "x_plus_c_minus_1");
+  llvm::Value *NumTiles = b_->CreateUDiv(Sum, TileSizeConstant, "num_tiles");
+  llvm::Value *ZeroConstant = llvm::ConstantInt::get(b_->getInt64Ty(), 0);
+
+  llvm::errs() << "Start:\n";
+  b_->GetInsertBlock()->getParent()->print(llvm::errs());
+
   llvm_ir::ForLoopNest loop_nest(llvm_ir::IrName(dot_hlo_name_), b_);
   std::vector<llvm::Value*> lhs_multi_index =
       loop_nest.EmitOperandArrayLoopNest(
@@ -642,6 +661,8 @@ void DotOpEmitter::EmitNaiveLlvmIrGemm() {
   std::vector<llvm::Value*> rhs_multi_index =
       loop_nest.EmitOperandArrayLoopNest(
           rhs_array_, /*dimension_to_skip=*/rhs_reduction_dimension, "rhs");
+  llvm::errs() << "After first:\n";
+  b_->GetInsertBlock()->getParent()->print(llvm::errs());
 
   // Create the loop which does the sum of products reduction.
   //
@@ -651,20 +672,42 @@ void DotOpEmitter::EmitNaiveLlvmIrGemm() {
   // reducing across the minor dimension in both LHS and RHS is vectorized well
   // by the loop vectorizer, we block unrolling in that case to stop loop unroll
   // from messing up the vectorization.
+  // llvm::errs() << "reduction dim size: " << lhs_shape.dimensions(lhs_reduction_dimension) << "\n";
+  std::unique_ptr<llvm_ir::ForLoop> outer_reduction_loop = loop_nest.AddLoop(
+      "outer_reduction",
+      ZeroConstant, NumTiles,
+      /*unroll_mode=*/
+      (lhs_reduction_along_minor_dimension &&
+       rhs_reduction_along_minor_dimension)
+          ? xla::llvm_ir::UnrollMode::kNoUnroll
+          : xla::llvm_ir::UnrollMode::kDefaultUnroll, true);
+  
   std::unique_ptr<llvm_ir::ForLoop> reduction_loop = loop_nest.AddLoop(
-      0, lhs_shape.dimensions(lhs_reduction_dimension), "reduction",
+      0, TILE_SIZE, "reduction",
       /*unroll_mode=*/
       (lhs_reduction_along_minor_dimension &&
        rhs_reduction_along_minor_dimension)
           ? xla::llvm_ir::UnrollMode::kNoUnroll
           : xla::llvm_ir::UnrollMode::kDefaultUnroll);
 
+  llvm::errs() << "After k loop construction:\n";
+  b_->GetInsertBlock()->getParent()->print(llvm::errs());
   // The final entry in the rhs and lhs indexes is the indvar of the
   // reduction loop.
-  lhs_multi_index[lhs_reduction_dimension] = reduction_loop->GetIndVarValue();
+  llvm::Instruction *my_inst = cast<llvm::Instruction>(reduction_loop->GetIndVarValue());
+  b_->SetInsertPoint(my_inst->getParent(), ++llvm::BasicBlock::iterator(my_inst));
+  llvm::Value *C = llvm::ConstantInt::get(reduction_loop->GetIndVarValue()->getType(), TILE_SIZE);
+  llvm::Value *Mul = b_->CreateMul(outer_reduction_loop->GetIndVarValue(), C, "outer_pos");
+  llvm::Value *Idx = b_->CreateAdd(Mul, reduction_loop->GetIndVarValue(), "reduction_idx");
+
+  llvm::errs() << "After recalculation of indices:\n";
+  b_->GetInsertBlock()->getParent()->print(llvm::errs());
+
+  // lhs_multi_index[lhs_reduction_dimension] = reduction_loop->GetIndVarValue();
+  lhs_multi_index[lhs_reduction_dimension] = Idx;
   llvm_ir::IrArray::Index lhs_index(lhs_multi_index, lhs_shape,
                                     b_->getInt64Ty());
-  rhs_multi_index[rhs_reduction_dimension] = reduction_loop->GetIndVarValue();
+  rhs_multi_index[rhs_reduction_dimension] = Idx;
   llvm_ir::IrArray::Index rhs_index(rhs_multi_index, rhs_shape,
                                     b_->getInt64Ty());
 
@@ -674,7 +717,7 @@ void DotOpEmitter::EmitNaiveLlvmIrGemm() {
 
   // Function entry basic block.
   // - Emit alloca for accumulator
-  llvm::Function* func = reduction_loop->GetPreheaderBasicBlock()->getParent();
+  llvm::Function* func = outer_reduction_loop->GetPreheaderBasicBlock()->getParent();
   SetToFirstInsertPoint(&func->getEntryBlock(), b_);
   llvm::Type* accum_type = target_array_.GetElementLlvmType();
   llvm::Value* accum_address =
@@ -682,7 +725,7 @@ void DotOpEmitter::EmitNaiveLlvmIrGemm() {
 
   // Preheader basic block of reduction loop:
   // - Initialize accumulator to zero.
-  llvm::BasicBlock* preheader_bb = reduction_loop->GetPreheaderBasicBlock();
+  llvm::BasicBlock* preheader_bb = outer_reduction_loop->GetPreheaderBasicBlock();
   b_->SetInsertPoint(preheader_bb->getTerminator());
 
   b_->CreateStore(llvm::Constant::getNullValue(accum_type), accum_address);
@@ -727,7 +770,7 @@ void DotOpEmitter::EmitNaiveLlvmIrGemm() {
   // Exit basic block of reduction loop.
   // - Load accumulator value (the result).
   // - Store into output array.
-  SetToFirstInsertPoint(reduction_loop->GetExitBasicBlock(), b_);
+  SetToFirstInsertPoint(outer_reduction_loop->GetExitBasicBlock(), b_);
 
   llvm::Value* result = b_->CreateLoad(accum_type, accum_address);
 
@@ -754,6 +797,8 @@ void DotOpEmitter::EmitNaiveLlvmIrGemm() {
   // Set the IR builder insert point to the exit basic block of the outer most
   // loop.
   b_->SetInsertPoint(loop_nest.GetOuterLoopExitBasicBlock());
+  llvm::errs() << "End\n";
+  b_->GetInsertBlock()->getParent()->print(llvm::errs());
 }
 
 absl::Status DotOpEmitter::EmitScalarDot() {
